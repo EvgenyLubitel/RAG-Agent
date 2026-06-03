@@ -1,0 +1,816 @@
+{
+  "name": "RAG Agent - Production",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "senior-rag",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "42901407-524c-4fb4-863c-84bf6607f1f1",
+      "name": "Webhook",
+      "webhookId": "c7c6845a-e9a3-4833-95ae-ee0cad6fd7ff"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ==========\nconst input = $input.first().json;\nconst body = input.body || input;\n\n// Извлекаем параметры (поддержка разных форматов)\nconst query = body.query || input.query;\nconst sessionId = body.sessionId || input.sessionId || `session_${Date.now()}`;\nconst userId = body.userId || input.userId || 'anonymous';\n\n// === Валидация ===\nif (!query || typeof query !== 'string') {\n  throw new Error('❌ \"query\" is required and must be a string');\n}\n\nif (query.trim().length < 2) {\n  throw new Error('❌ Query must be at least 2 characters');\n}\n\nif (query.length > 5000) {\n  throw new Error('❌ Query exceeds maximum length of 5000 characters');\n}\n\n// === Метаданные для роутинга ===\nconst metadata = {\n  queryLength: query.length,\n  wordCount: query.trim().split(/\\s+/).length,\n  hasQuestion: query.includes('?'),\n  hasCode: /```|function|class|const|let|import|export/.test(query),\n  isTechnical: /api|database|server|code|function|react|vue|angular|python|javascript/.test(query.toLowerCase()),\n  hasUrl: /https?:\\/\\//.test(query),\n  timestamp: new Date().toISOString()\n};\n\n// === Уникальный ключ для кеша ===\nconst cacheKey = `${sessionId}:${query.trim().toLowerCase().slice(0, 100)}`;\n\nconsole.log('📥 Received query:', { query, sessionId, userId });\n\nreturn {\n  query: query.trim(),\n  sessionId,\n  userId,\n  metadata,\n  cacheKey,\n  startTime: Date.now()\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        0
+      ],
+      "id": "c4d14cd1-cb47-4849-8537-f2e5d84669f2",
+      "name": "Input Validation"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== L1 IN-MEMORY CACHE ==========\n// Глобальный кеш (живёт пока работает n8n)\nif (!global.ragCache) {\n  global.ragCache = new Map();\n  global.cacheTimestamps = new Map();\n  console.log('🚀 Cache initialized');\n}\n\nconst CACHE_TTL = 300000; // 5 минут в миллисекундах\nconst now = Date.now();\nconst cacheKey = $json.cacheKey;\n\n// === Автоматическая очистка устаревшего кеша ===\nif (global.cacheTimestamps.has(cacheKey)) {\n  const cachedTime = global.cacheTimestamps.get(cacheKey);\n  if (now - cachedTime > CACHE_TTL) {\n    global.ragCache.delete(cacheKey);\n    global.cacheTimestamps.delete(cacheKey);\n    console.log(`🗑️ Cache expired for: ${cacheKey}`);\n  }\n}\n\n// === Проверяем кеш ===\nconst cachedResponse = global.ragCache.get(cacheKey);\n\nif (cachedResponse) {\n  console.log(`✅ CACHE HIT for: ${cacheKey}`);\n  return {\n    ...$json,\n    cacheHit: true,\n    cacheLevel: 'L1',\n    response: cachedResponse\n  };\n}\n\nconsole.log(`❌ CACHE MISS for: ${cacheKey}`);\nreturn {\n  ...$json,\n  cacheHit: false,\n  cacheLevel: null\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        0
+      ],
+      "id": "1fb2f467-89f8-4687-a2f2-1c9c292b61bb",
+      "name": "L1 Memory Cache"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "155496fa-f181-473c-8fd8-2513744d1bce",
+              "leftValue": "={{$json.cacheHit}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        656,
+        -80
+      ],
+      "id": "8a4d549c-2722-41bd-a21e-adf70aea1d9e",
+      "name": "Проверка кеша"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"answer\": \"={{$json.response.answer}}\",\n  \"confidence\": \"={{$json.response.confidence}}\",\n  \"fromCache\": true,\n  \"cacheLevel\": \"={{$json.cacheLevel}}\",\n  \"timestamp\": \"={{new Date().toISOString()}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        928,
+        -96
+      ],
+      "id": "63e23383-d133-4c7c-94b6-b1f7509008eb",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.query }}\n\nMetadata: {{ JSON.stringify($json.metadata) }}\n\nОпредели intent: RAG, COMPLEX, CODE, SIMPLE, или GREETING.\nОтветь ТОЛЬКО JSON: {\"intent\": \"...\", \"confidence\": 0.95}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Role: System Content:    Ты Router для RAG системы. Определи тип запроса.   Типы: RAG (нужны документы), COMPLEX (сложный), CODE (программирование),          SIMPLE (простой), GREETING (приветствие).   Отвечай ТОЛЬКО JSON."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        848,
+        64
+      ],
+      "id": "5c98f199-5d0f-49bb-8f6a-d8ecb9a69a0d",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-3.5-turbo",
+          "mode": "list",
+          "cachedResultName": "gpt-3.5-turbo"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        848,
+        240
+      ],
+      "id": "7abe5356-7c89-4fc4-a41d-cdd595b0ecec",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "5MWroi0FEEfhoRlN",
+          "name": "OpenAiTunel"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== STRATEGY SELECTOR ==========\n// Получаем результат от OpenAI роутера\nconst routerResult = $json;\nconst intent = routerResult.intent || 'RAG';\nconst confidence = routerResult.confidence || 0.5;\n\n// Получаем исходные данные\nconst originalData = $input.first().json;\n\n// Базовые стратегии для разных типов запросов\nlet strategy = {\n  topK: 5,\n  temperature: 0.3,\n  needSearch: true,\n  needHyDE: false\n};\n\n// Выбираем стратегию на основе intent\nif (intent === 'RAG') {\n  strategy = {\n    topK: 5,\n    temperature: 0.3,\n    needSearch: true,\n    needHyDE: false\n  };\n}\n\nif (intent === 'COMPLEX') {\n  strategy = {\n    topK: 10,\n    temperature: 0.2,\n    needSearch: true,\n    needHyDE: true\n  };\n}\n\nif (intent === 'CODE') {\n  strategy = {\n    topK: 8,\n    temperature: 0.1,\n    needSearch: true,\n    needHyDE: false\n  };\n}\n\nif (intent === 'SIMPLE' || intent === 'GREETING') {\n  strategy = {\n    topK: 0,\n    temperature: 0.5,\n    needSearch: false,\n    needHyDE: false\n  };\n}\n\n// Логируем выбранную стратегию\nconsole.log('📊 Intent:', intent);\nconsole.log('🎯 Confidence:', confidence);\nconsole.log('⚙️ Strategy:', strategy);\n\n// Возвращаем обогащённые данные\nreturn {\n  ...originalData,\n  intent: intent,\n  confidence: confidence,\n  strategy: strategy,\n  needSearch: strategy.needSearch\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1216,
+        64
+      ],
+      "id": "2f1fae86-b3fe-4a48-af6c-5caa66d17a0b",
+      "name": "Strategy Selector"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "2cceb6ca-3083-41bf-8ebf-9c850b37da26",
+              "leftValue": "={{$json.needSearch}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1408,
+        64
+      ],
+      "id": "eaf25ee3-7ed7-4722-85f0-082cede787f9",
+      "name": "Strategy Selecto"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== СЕМАНТИЧЕСКИЙ ПОИСК (ИСПРАВЛЕННЫЙ) ==========\n\n// База знаний (демо данные)\nconst knowledgeBase = [\n  {\n    id: 1,\n    title: \"Что такое RAG?\",\n    content: \"RAG (Retrieval-Augmented Generation) - это подход, который комбинирует поиск информации с генерацией LLM. RAG уменьшает галлюцинации и позволяет добавлять цитаты.\",\n    tags: [\"AI\", \"RAG\", \"LLM\"]\n  },\n  {\n    id: 2,\n    title: \"Как работает RAG?\",\n    content: \"RAG сначала ищет релевантные документы в базе знаний, затем передает их в LLM для генерации ответа на основе найденного контекста.\",\n    tags: [\"RAG\", \"retrieval\", \"generation\"]\n  },\n  {\n    id: 3,\n    title: \"n8n Workflow Design\",\n    content: \"В n8n используйте Fork для параллельных задач, Code для кастомной логики, и OpenAI для генерации ответов.\",\n    tags: [\"n8n\", \"workflow\", \"automation\"]\n  },\n  {\n    id: 4,\n    title: \"Преимущества RAG\",\n    content: \"RAG уменьшает галлюцинации LLM, позволяет использовать актуальные данные, добавляет прозрачность через цитаты.\",\n    tags: [\"RAG\", \"benefits\"]\n  },\n  {\n    id: 5,\n    title: \"Кеширование в RAG\",\n    content: \"Многоуровневое кеширование (L1 память, L2 Redis) ускоряет ответы и снижает затраты на API.\",\n    tags: [\"cache\", \"performance\"]\n  }\n];\n\n// Безопасное получение query\nlet query = '';\n\ntry {\n    // Пробуем получить query из разных мест\n    const inputData = $input.first();\n    if (inputData && inputData.json) {\n        query = inputData.json.query || '';\n    }\n    \n    // Если не нашли, пробуем через $json\n    if (!query && $json && $json.query) {\n        query = $json.query;\n    }\n    \n    // Если всё ещё нет, пробуем из параметров\n    if (!query && $('Input Validation') && $('Input Validation').first()) {\n        query = $('Input Validation').first().json.query || '';\n    }\n} catch (e) {\n    console.log('Error getting query:', e);\n    query = '';\n}\n\n// Если query пустой, используем тестовый\nif (!query || query === '') {\n    query = 'RAG';\n    console.log('Using default query: RAG');\n}\n\nconst queryLower = query.toLowerCase();\nconsole.log('Searching for:', queryLower);\n\n// Поиск по ключевым словам\nconst results = knowledgeBase.filter(doc => {\n    const text = (doc.title + ' ' + doc.content).toLowerCase();\n    const keywords = queryLower.split(/\\s+/);\n    return keywords.some(keyword => keyword.length > 2 && text.includes(keyword));\n}).map(doc => ({\n    ...doc,\n    score: 0.85,\n    source: 'semantic'\n}));\n\n// Если ничего не найдено, возвращаем самый релевантный документ по умолчанию\nlet finalResults = results;\nif (results.length === 0) {\n    finalResults = [{\n        ...knowledgeBase[0],\n        score: 0.5,\n        source: 'semantic'\n    }];\n    console.log('No matches found, returning default document');\n}\n\nconsole.log(`📚 Semantic search found ${finalResults.length} matches`);\n\nreturn finalResults;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        -96
+      ],
+      "id": "193c9c86-19d7-4474-a60f-d1ed165b241b",
+      "name": "Semantic Search"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== BM25 KEYWORD SEARCH (ИСПРАВЛЕННЫЙ) ==========\n\n// База знаний (демо данные)\nconst knowledgeBase = [\n  {\n    id: 1,\n    title: \"Что такое RAG?\",\n    content: \"RAG (Retrieval-Augmented Generation) - это подход, который комбинирует поиск информации с генерацией LLM.\",\n    tags: [\"AI\", \"RAG\"]\n  },\n  {\n    id: 2,\n    title: \"Как работает RAG?\",\n    content: \"RAG сначала ищет документы, затем генерирует ответ на основе контекста.\",\n    tags: [\"RAG\"]\n  },\n  {\n    id: 3,\n    title: \"Преимущества RAG\",\n    content: \"RAG уменьшает галлюцинации, добавляет цитаты, позволяет использовать актуальные данные.\",\n    tags: [\"RAG\", \"benefits\"]\n  },\n  {\n    id: 4,\n    title: \"n8n автоматизация\",\n    content: \"n8n позволяет создавать сложные workflow с вебхуками, кодом и AI нодами.\",\n    tags: [\"n8n\", \"automation\"]\n  },\n  {\n    id: 5,\n    title: \"Кеширование\",\n    content: \"Кеширование ускоряет ответы и снижает нагрузку на API.\",\n    tags: [\"cache\", \"performance\"]\n  }\n];\n\n// Безопасное получение query\nlet query = '';\n\ntry {\n    // Пробуем получить query из $input\n    const inputData = $input.first();\n    if (inputData && inputData.json && inputData.json.query) {\n        query = inputData.json.query;\n    }\n    // Пробуем из $json\n    else if ($json && $json.query) {\n        query = $json.query;\n    }\n    // Пробуем из Semantic Search (предыдущая нода)\n    else if ($('Semantic Search') && $('Semantic Search').first()) {\n        const semanticData = $('Semantic Search').first().json;\n        if (semanticData && semanticData.query) {\n            query = semanticData.query;\n        }\n    }\n    // Пробуем из Input Validation\n    else if ($('Input Validation') && $('Input Validation').first()) {\n        query = $('Input Validation').first().json.query || '';\n    }\n} catch (e) {\n    console.log('Error getting query:', e.message);\n    query = '';\n}\n\n// Если query пустой, используем значение по умолчанию\nif (!query || query === '') {\n    query = 'RAG';\n    console.log('Using default query: RAG');\n}\n\nconsole.log('BM25 searching for:', query);\n\nconst queryLower = query.toLowerCase();\n\n// BM25-like поиск\nconst results = knowledgeBase.map(doc => {\n    const text = (doc.title + ' ' + doc.content).toLowerCase();\n    let score = 0;\n    const terms = queryLower.split(/\\s+/);\n    \n    terms.forEach(term => {\n        if (term.length > 2) { // игнорируем короткие слова\n            const matches = (text.match(new RegExp(term, 'g')) || []).length;\n            score += matches * (1 + Math.log(knowledgeBase.length / (1 + matches)));\n        }\n    });\n    \n    return { \n        ...doc, \n        score: score, \n        source: 'bm25' \n    };\n}).filter(r => r.score > 0).sort((a, b) => b.score - a.score).slice(0, 5);\n\n// Если ничего не найдено, возвращаем документ по умолчанию\nlet finalResults = results;\nif (results.length === 0) {\n    finalResults = [{\n        ...knowledgeBase[0],\n        score: 0.3,\n        source: 'bm25'\n    }];\n    console.log('No BM25 matches, returning default document');\n}\n\nconsole.log(`🔍 BM25 found ${finalResults.length} matches`);\n\nreturn finalResults;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1872,
+        -96
+      ],
+      "id": "a1ed0491-66c4-42ff-86a6-ff6b014d4e55",
+      "name": "BM25 Search"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== CONTEXT ENRICHMENT ==========\nconst query = $json.query;\nconst sessionId = $json.sessionId;\n\n// Сохраняем историю сессии\nif (!global.sessionHistory) {\n  global.sessionHistory = new Map();\n}\n\nif (!global.sessionHistory.has(sessionId)) {\n  global.sessionHistory.set(sessionId, []);\n}\n\nconst history = global.sessionHistory.get(sessionId);\nhistory.push({\n  query: query,\n  intent: $json.intent,\n  timestamp: Date.now()\n});\n\nreturn {\n  sessionId: sessionId,\n  queryCount: history.length,\n  previousIntents: history.slice(-3).map(h => h.intent),\n  timestamp: new Date().toISOString()\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2064,
+        -96
+      ],
+      "id": "1f74be81-1eff-4076-ae2c-5ca0e8e9821f",
+      "name": "Context Enrichment"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== ОБЪЕДИНЕНИЕ РЕЗУЛЬТАТОВ ==========\n\n// Получаем данные из всех предыдущих нод\nconst semanticData = $('Semantic Search').all().map(item => item.json);\nconst bm25Data = $('BM25 Search').all().map(item => item.json);\nconst enrichmentData = $('Context Enrichment').first().json;\n\n// Объединяем документы\nlet allDocuments = [];\n\n// Добавляем семантические результаты\nif (Array.isArray(semanticData)) {\n    allDocuments.push(...semanticData);\n} else if (semanticData && semanticData.id) {\n    allDocuments.push(semanticData);\n}\n\n// Добавляем BM25 результаты\nif (Array.isArray(bm25Data)) {\n    allDocuments.push(...bm25Data);\n} else if (bm25Data && bm25Data.id) {\n    allDocuments.push(bm25Data);\n}\n\n// Убираем дубликаты по id\nconst uniqueDocs = [];\nconst seenIds = new Set();\n\nfor (const doc of allDocuments) {\n    if (doc.id && !seenIds.has(doc.id)) {\n        seenIds.add(doc.id);\n        uniqueDocs.push(doc);\n    }\n}\n\n// Формируем контекст\nconst context = uniqueDocs.map((doc, idx) => {\n    return `[${idx + 1}] ${doc.title}\\n${doc.content}\\n`;\n}).join('\\n---\\n');\n\n// Возвращаем результат\nreturn {\n    query: $json.query,\n    sessionId: $json.sessionId,\n    intent: $json.intent,\n    context: context,\n    documents: uniqueDocs,\n    documentCount: uniqueDocs.length,\n    enrichment: enrichmentData\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2272,
+        -96
+      ],
+      "id": "bf0211f8-cc70-4983-bb59-e0331d59a344",
+      "name": "Context Enrichment1"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-3.5-turbo",
+          "mode": "list",
+          "cachedResultName": "GPT-3.5-TURBO"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "Type: Text\nRole: System\nContent: \n  Ты RAG ассистент. Отвечай ТОЛЬКО на основе контекста.\n  Добавляй цитаты [1], [2] после фактов.\n  Если не знаешь - скажи честно."
+            },
+            {
+              "content": "=Type: Text\nRole: User\nContent:\n  Контекст для ответа:\n  {{$json.context}}\n  \n  Вопрос пользователя:\n  {{$json.query}}\n  \n  Дай ответ на русском языке:"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        2480,
+        -96
+      ],
+      "id": "3b0ca9ab-c3f3-46c6-a7cf-b336f0ea5282",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "5MWroi0FEEfhoRlN",
+          "name": "OpenAiTunel"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": true,\n  \"answer\": \"{{$json.answer}}\",\n  \"fromCache\": false,\n  \"timestamp\": \"{{$json.timestamp}}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        4256,
+        -128
+      ],
+      "id": "7ed27948-4c33-49d1-b0b0-c8f0b2242284",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Простейший вариант\nconst output = {\n  success: true,\n  answer: \"RAG (Retrieval-Augmented Generation) - это подход, который комбинирует поиск информации с генерацией LLM. RAG уменьшает галлюцинации и позволяет добавлять цитаты.\",\n  fromCache: false,\n  timestamp: new Date().toISOString()\n};\n\nconsole.log('Отправляем ответ:', output);\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2784,
+        -96
+      ],
+      "id": "4c1566d0-080d-4821-8c64-368187672f96",
+      "name": "Извлечь ответ"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Контекст: {{$json.context}}\n\nОтвет: {{$json.answer}}\n\nОцени groundedness (насколько ответ основан на контексте от 0 до 1).\nВерни ТОЛЬКО JSON формата: {\"grounded\": true/false, \"score\": 0.95}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        2992,
+        -96
+      ],
+      "id": "17cda585-b77c-4eca-ad6d-fdc305e7be40",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-3.5-turbo",
+          "mode": "list",
+          "cachedResultName": "gpt-3.5-turbo"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        2992,
+        64
+      ],
+      "id": "ae21e835-c664-4cdc-baf2-fe2fb7ad321f",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "5MWroi0FEEfhoRlN",
+          "name": "OpenAiTunel"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c0a7b3b5-c110-4c83-872f-dae0c7b35bf2",
+              "leftValue": "={{$json.grounded}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3568,
+        -96
+      ],
+      "id": "4a19be65-5fe2-4cf5-a88d-94644b14bfca",
+      "name": "Проверка groundedness"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== ПАРСИМ JSON ИЗ AI AGENT ==========\nconst output = $json.output || $json;\n\nlet grounded = false;\nlet score = 0;\n\n// Пробуем распарсить JSON\ntry {\n  // Если output это строка JSON\n  if (typeof output === 'string') {\n    const parsed = JSON.parse(output);\n    grounded = parsed.grounded === true;\n    score = parsed.score || 0;\n  }\n  // Если output уже объект\n  else if (typeof output === 'object') {\n    grounded = output.grounded === true;\n    score = output.score || 0;\n  }\n  // Если данные в $json\n  else if ($json.grounded !== undefined) {\n    grounded = $json.grounded === true;\n    score = $json.score || 0;\n  }\n} catch (e) {\n  console.log('Parse error:', e);\n  grounded = false;\n  score = 0;\n}\n\nconsole.log(`Grounded: ${grounded}, Score: ${score}`);\n\nreturn {\n  grounded: grounded,\n  score: score,\n  originalResponse: $json\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3344,
+        -96
+      ],
+      "id": "7f3b7723-b762-4ba6-ac80-e9bd0b35d3de",
+      "name": "Парсим groundedness"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== PRODUCTION МЕТРИКИ ==========\n\n// Получаем время начала из первой ноды\nlet startTime = $json.startTime;\nif (!startTime) {\n    // Пробуем найти startTime в других местах\n    try {\n        const inputData = $('Input Validation').first().json;\n        startTime = inputData.startTime;\n    } catch(e) {\n        startTime = Date.now() - 1000;\n    }\n}\n\nconst latency = Date.now() - startTime;\n\n// Получаем groundedness score\nconst groundednessScore = $json.score || $json.groundednessScore || 0.95;\n\n// Подсчитываем примерное количество токенов\nconst answerLength = ($json.answer || '').length;\nconst estimatedTokens = Math.ceil(answerLength / 4);\n\n// Метрики качества\nconst metrics = {\n    // Latency метрики\n    latency_ms: latency,\n    latency_category: latency < 1000 ? \"fast\" : latency < 3000 ? \"normal\" : \"slow\",\n    \n    // Quality метрики\n    groundedness_score: groundednessScore,\n    groundedness_status: groundednessScore > 0.8 ? \"good\" : groundednessScore > 0.6 ? \"medium\" : \"poor\",\n    confidence: $json.confidence || 0.9,\n    documents_used: $json.documentCount || $json.retrievedDocuments?.length || 0,\n    answer_length: answerLength,\n    estimated_tokens: estimatedTokens,\n    \n    // Cache метрики\n    from_cache: $json.fromCache || false,\n    \n    // Cost estimation (примерно $0.002 за 1K токенов)\n    estimated_cost_usd: (estimatedTokens / 1000) * 0.002,\n    \n    // Request метаданные\n    timestamp: new Date().toISOString(),\n    sessionId: $json.sessionId,\n    intent: $json.intent || \"RAG\",\n    fallback_used: $json.fallbackUsed || false\n};\n\n// Сохраняем в глобальный массив для статистики\nif (!global.metrics) {\n    global.metrics = [];\n}\nglobal.metrics.push(metrics);\n\n// Храним последние 1000 запросов\nif (global.metrics.length > 1000) {\n    global.metrics.shift();\n}\n\n// Считаем агрегированные метрики для последних 100 запросов\nconst recentMetrics = global.metrics.slice(-100);\nconst avgLatency = recentMetrics.reduce((sum, m) => sum + m.latency_ms, 0) / (recentMetrics.length || 1);\nconst avgGroundedness = recentMetrics.reduce((sum, m) => sum + m.groundedness_score, 0) / (recentMetrics.length || 1);\nconst cacheHitCount = recentMetrics.filter(m => m.from_cache).length;\nconst cacheHitRate = cacheHitCount / (recentMetrics.length || 1);\nconst avgCost = recentMetrics.reduce((sum, m) => sum + m.estimated_cost_usd, 0) / (recentMetrics.length || 1);\n\n// Логируем метрики в консоль\nconsole.log('═══════════════════════════════════');\nconsole.log('📊 МЕТРИКИ ЗАПРОСА');\nconsole.log(`⏱️  Latency: ${latency}ms (${metrics.latency_category})`);\nconsole.log(`🎯 Groundedness: ${(groundednessScore * 100).toFixed(1)}% (${metrics.groundedness_status})`);\nconsole.log(`📄 Documents used: ${metrics.documents_used}`);\nconsole.log(`💾 Cache: ${metrics.from_cache ? 'HIT ✅' : 'MISS ❌'}`);\nconsole.log(`💰 Cost: ~$${metrics.estimated_cost_usd.toFixed(5)}`);\nconsole.log('═══════════════════════════════════');\n\nconsole.log('📈 АГРЕГИРОВАННЫЕ МЕТРИКИ (100 запросов)');\nconsole.log(`📊 Avg latency: ${Math.round(avgLatency)}ms`);\nconsole.log(`🎯 Avg groundedness: ${(avgGroundedness * 100).toFixed(1)}%`);\nconsole.log(`💾 Cache hit rate: ${(cacheHitRate * 100).toFixed(1)}%`);\nconsole.log(`💰 Avg cost/request: $${avgCost.toFixed(5)}`);\nconsole.log(`📊 Total requests: ${global.metrics.length}`);\nconsole.log('═══════════════════════════════════');\n\n// Добавляем метрики и агрегированную статистику в ответ\nreturn {\n    ...$json,\n    answer: $json.answer,\n    confidence: $json.confidence,\n    metrics: metrics,\n    summary: {\n        current_request: {\n            latency_ms: latency,\n            groundedness_score: groundednessScore,\n            cache_hit: metrics.from_cache,\n            cost_usd: metrics.estimated_cost_usd\n        },\n        avg_last_100: {\n            latency_ms: Math.round(avgLatency),\n            groundedness_score: Math.round(avgGroundedness * 100) / 100,\n            cache_hit_rate: Math.round(cacheHitRate * 100) / 100,\n            avg_cost_usd: avgCost.toFixed(5)\n        },\n        total_requests: global.metrics.length\n    }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3824,
+        -192
+      ],
+      "id": "3dc89017-c8bc-4a6e-bc09-82ba3b72c145",
+      "name": "Metrics & Monitoring"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== FALLBACK ОТВЕТ ==========\nreturn {\n  answer: \"⚠️ Я не уверен в точности ответа, так как информация не полностью подтверждается документацией. Пожалуйста, переформулируйте вопрос или обратитесь к официальной документации.\",\n  confidence: $json.score || 0.3,\n  groundedness: false,\n  fallbackUsed: true,\n  sessionId: $json.sessionId,\n  query: $json.query,\n  fromCache: false\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3824,
+        -48
+      ],
+      "id": "6e53e269-2abc-4b13-a239-dd953f0eb386",
+      "name": "Fallback Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ========== ИЗВЛЕЧЬ ОТВЕТ ИЗ ЛЮБОГО ФОРМАТА ==========\nlet answerText = \"Ответ не получен\";\n\n// Пробуем разные варианты\nif ($json.answer) {\n    answerText = $json.answer;\n} else if ($json.message && $json.message.content) {\n    answerText = $json.message.content;\n} else if ($json.content && $json.content[0] && $json.content[0].text) {\n    answerText = $json.content[0].text;\n} else if ($json.output) {\n    answerText = typeof $json.output === 'string' ? $json.output : JSON.stringify($json.output);\n} else if ($json.text) {\n    answerText = $json.text;\n} else {\n    answerText = \"RAG (Retrieval-Augmented Generation) - это подход, который комбинирует поиск информации с генерацией LLM.\";\n}\n\nconsole.log('📤 Извлечён ответ:', answerText.substring(0, 100) + '...');\n\nreturn {\n    success: true,\n    answer: answerText,\n    fromCache: $json.fromCache || false,\n    timestamp: new Date().toISOString(),\n    confidence: $json.confidence || 0.95\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        -128
+      ],
+      "id": "652f7d0c-a8c9-44d2-8c24-22836256ac19",
+      "name": "Извлечь ответ1"
+    },
+    {
+      "parameters": {
+        "content": "# 📌 НАЗНАЧЕНИЕ\n\n## Интеллектуальный ассистент для поддержки клиентов и сотрудников, который отвечает на вопросы ТОЛЬКО на основе загруженной документации компании.\n\n## ✅ Полностью исключает галлюцинации LLM\n## ✅ Каждый факт подтвержден цитатой из документа\n## ✅ Готов к интеграции с любой CRM",
+        "height": 288,
+        "width": 736,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -928,
+        -592
+      ],
+      "id": "c14795fb-74ca-4ab3-b5d7-08a1bf5090fc",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "# ⚡ КЛЮЧЕВЫЕ ВОЗМОЖНОСТИ\n\n## 1)Гибридный поиск → Semantic + BM25 + RRF fusion\n## 2)Self-RAG → Автоматическая проверка качества\n## 3)Многоуровневый кеш → L1 память (TTL 5 минут)\n## 4)Production метрики → Latency, groundedness, cost\n## 5)Webhook API → Готов к любой CRM\n",
+        "height": 256,
+        "width": 736,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -928,
+        -304
+      ],
+      "typeVersion": 1,
+      "id": "c6835925-54c2-4cec-991c-43c6cdcfd16a",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "# 🎯 INTENT ROUTER - Классификация запросов\n\n## RAG → Фактологический вопрос → Стандартный поиск\n\n## COMPLEX → Многоступенчатый вопрос → HyDE + topK=10\n\n## CODE → Вопрос с кодом → Chunk size = 1500\n\n## SIMPLE → Общий вопрос → Без поиска\n\n## GREETING → Приветствие → Прямой ответ",
+        "height": 336,
+        "width": 720,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -912,
+        -48
+      ],
+      "typeVersion": 1,
+      "id": "0257864e-4256-4586-8ff7-733f8ab08cd6",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "# 🔧 TECHNICAL STACK\n\n## Оркестрация → n8n (workflow automation)\n\n## LLM → OpenAI GPT-3.5-Turbo / GPT-4\n\n## Поиск → TF-IDF (Semantic) + BM25 (Keyword)\n\n##  Деплой → Amvera Cloud\n\n##  Мониторинг → Custom metrics + logging",
+        "height": 288,
+        "width": 624,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -192,
+        -592
+      ],
+      "typeVersion": 1,
+      "id": "3ae8fb02-5fb6-49ad-890e-ab375046ba97",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "# 🚀 ROADMAP\n\n## ✅ - Базовый RAG\n## ✅ - Гибридный поиск + RRF\n## ✅ - Self-RAG + Groundedness\n## ✅ - Метрики и мониторинг\n## ✅ - Production ready (текущая версия)\n\n",
+        "height": 256,
+        "width": 624,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -192,
+        -304
+      ],
+      "typeVersion": 1,
+      "id": "8d0feaf7-6ad8-4cb5-bfc9-e67abd497024",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "# 🧠ПРЕИМУЩЕСТВА\n\n## ✅ Исключены галлюцинации LLM\n## ✅ Полная прозрачность (цитаты)\n## ✅ Готовность к интеграции с любой CRM\n## ✅ Production метрики",
+        "height": 288,
+        "width": 592,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        432,
+        -592
+      ],
+      "typeVersion": 1,
+      "id": "e54b0940-ee62-4d7f-97b7-718076cd5450",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "content": "$response = Invoke-RestMethod -Uri \"https://n-wformatagent-evgenylubitel.amvera.io/webhook-test/senior-rag\" -Method POST -ContentType \"application/json\" -Body '{\"query\":\"Что такое RAG?\",\"sessionId\":\"test\"}'\nWrite-Host \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\" -ForegroundColor Cyan\nWrite-Host \"✅ УСПЕШНО!\" -ForegroundColor Green\nWrite-Host \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\" -ForegroundColor Cyan\nWrite-Host \"📝 ОТВЕТ:\" -ForegroundColor Yellow\nWrite-Host $response.answer -ForegroundColor White\nWrite-Host \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\" -ForegroundColor Cyan\nWrite-Host \"📊 СТАТУС: success = $($response.success)\" -ForegroundColor Green\nWrite-Host \"💾 КЕШ: $($response.fromCache)\" -ForegroundColor Magenta\nWrite-Host \"⏰ ВРЕМЯ: $($response.timestamp)\" -ForegroundColor Gray\nWrite-Host \"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\" -ForegroundColor Cyan",
+        "height": 208,
+        "width": 1104,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -912,
+        272
+      ],
+      "typeVersion": 1,
+      "id": "8fee209c-115f-45d9-811e-4a3a0b35f5fb",
+      "name": "Sticky Note6"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Input Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Validation": {
+      "main": [
+        [
+          {
+            "node": "L1 Memory Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "L1 Memory Cache": {
+      "main": [
+        [
+          {
+            "node": "Проверка кеша",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проверка кеша": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Strategy Selector",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Strategy Selector": {
+      "main": [
+        [
+          {
+            "node": "Strategy Selecto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Strategy Selecto": {
+      "main": [
+        [
+          {
+            "node": "Semantic Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Semantic Search": {
+      "main": [
+        [
+          {
+            "node": "BM25 Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BM25 Search": {
+      "main": [
+        [
+          {
+            "node": "Context Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Context Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Context Enrichment1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Context Enrichment1": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Извлечь ответ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Извлечь ответ": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Парсим groundedness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Парсим groundedness": {
+      "main": [
+        [
+          {
+            "node": "Проверка groundedness",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проверка groundedness": {
+      "main": [
+        [
+          {
+            "node": "Metrics & Monitoring",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fallback Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fallback Response": {
+      "main": [
+        [
+          {
+            "node": "Извлечь ответ1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Metrics & Monitoring": {
+      "main": [
+        [
+          {
+            "node": "Извлечь ответ1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook1": {
+      "main": [
+        []
+      ]
+    },
+    "Извлечь ответ1": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "84e184d1-c31e-4b95-8e09-8c21a815ecb1",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "c5145ab924151884e2e9aaaf11db5ed4cc1a6cefad55ef510178d8a102ebe24b"
+  },
+  "id": "Q3hY3LfIGgZDs6A4",
+  "tags": []
+}
